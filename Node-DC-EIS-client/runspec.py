@@ -41,14 +41,26 @@ import zipfile
 import platform
 from itertools import izip
 from threading import Thread,Timer
-from multiprocessing import Process
-from multiprocessing import Queue
+from multiprocessing import Process,Pool,Queue
+import multiprocessing
 import node_dc_eis_testurls
 from node_dc_eis_testurls import *
 from process_time_based_output import process_time_based_output
 import traceback
 import urllib
 import util
+
+runModes = {
+  'Time': 'time',
+  'Requests': 'requests'
+}
+
+phases = {
+  'RampUp': 'RU',
+  'SteadyState': 'SS',
+  'RampDown': 'RD',
+  'ShutDown': 'SD'
+}
 
 # Seed RNG for consistent runs?
 if os.environ.get('NODE_DC_EIS_RNG_SEED'):
@@ -65,6 +77,7 @@ seed(rng_seed)
 temp_log = "RTdata"
 request = 10000
 MT_interval = 100
+nCoresToUse = None
 concurrency = 200
 rampup_rampdown = 10
 total_urls = 100
@@ -82,7 +95,7 @@ postid_index = 0
 keep_on_running = True # Initializing keep_on_running to True
 #default set to 1. Set it to 0 if ramp up rampdown phase is not required
 ramp = 1
-phase = "MT"
+phase = phases['SteadyState']
 log =""
 log_dir =""
 interval = 10
@@ -92,7 +105,7 @@ rundir = ""
 multiple_instance = False
 memlogind = "requestsdone.ind"
 cpuCount = -1
-run_mode = 1
+runMode = runModes['Time']
 
 http_headers = []
 
@@ -225,7 +238,7 @@ def main():
   global rundir
   global output_file
   global multiple_instance
-  global run_mode
+  global runMode
   global no_graph
   global no_db
   global get_endpoints
@@ -254,15 +267,18 @@ def main():
   parser.add_argument('-n','--request',dest="request",
                   action="store",
                   help='Number of requests to perform')
+  parser.add_argument('-z','--nCoresToUse',dest="nCoresToUse",
+                  action="store",
+                  help='Number of cores to use')
   parser.add_argument('-c','--concurrency',dest="concurrency",
                   action="store",
-                  help='Number of multiple requests to perform')
+                  help='Number of multiple requests to perform on each core')
   parser.add_argument('-W','--rampup_rampdown',dest="rampup_rampdown",
                   action="store",
                   help='Number of rampup-rampdown requests to perform')
   parser.add_argument('-r','--run_mode',dest="run_mode",
-                  action="store", choices=[1, 2], type=int,
-                  help='1 for time based run. 2 for request based run. Default is 1')
+                  action="store", choices=runModes.values(),
+                  help='default is %s' % (runModes['Time']))
   parser.add_argument('-int','--interval',dest="interval",action="store",
                   help='Interval after which logging switches to next temp log file')
   parser.add_argument('-log','--templogfile',dest="templogfile",
@@ -327,6 +343,7 @@ def main():
         global request
         global MT_interval
         global interval
+        global nCoresToUse
         global concurrency
         global rampup_rampdown
         global url_file
@@ -366,10 +383,18 @@ def main():
             request = int(json_data["client_params"]["request"])
 
           if "run_mode" in json_data["client_params"]:
-            run_mode = int(json_data["client_params"]["run_mode"])
+            runMode = json_data["client_params"]["run_mode"]
+            if runMode == runModes['Time'] or runMode == runModes['Requests']:
+              print ("runMode %s" % (runMode))
+            else:
+              print ("Unexpected runMode %s" % (runMode))
+              sys.exit(1)
+
+          if "nCoresToUse" in json_data["client_params"]:
+            nCoresToUse = int(json_data["client_params"]["nCoresToUse"])
 
           if "concurrency" in json_data["client_params"]:
-            concurrency = json_data["client_params"]["concurrency"]
+            concurrency = int(json_data["client_params"]["concurrency"])
 
           if "interval" in json_data["client_params"]:
             interval = int(json_data["client_params"]["interval"])
@@ -485,6 +510,9 @@ def main():
   if(options.request) :
     request = options.request
 
+  if(options.nCoresToUse) :
+    nCoresToUse = int(options.nCoresToUse)
+
   if(options.concurrency) :
     concurrency = options.concurrency
 
@@ -496,7 +524,12 @@ def main():
     ramp = 1
 
   if(options.run_mode) :
-    run_mode = int(options.run_mode)
+    runMode = options.run_mode
+    if runMode == runModes['Time'] or runMode == runModes['Requests']:
+      print ("runMode %s" % (runMode))
+    else:
+      print ("Unexpected runMode %s" % (runMode))
+      sys.exit(1)
 
   if(options.templogfile) :
     temp_log = options.templogfile
@@ -561,17 +594,18 @@ def run_printenv(log):
   # Output: None
   """
 
-  if run_mode == 1:
+  if runMode == runModes['Time']:
     print >> log, "** Time based run **"
   else:
     print >> log, "** Requests based run **"
 
   print >> log, ('Server url is : %s' % server_url)
-  if run_mode == 1:
+  if runMode == runModes['Time']:
     print >> log, "Runtime interval:"+ str(MT_interval) +"  (Default value = 60s)"
   else:
     print >> log, "Requests    :"+ str(request) +"  (Default value = 10000)"
 
+  print >> log, "ncoresToUse :"+ str(nCoresToUse) +"  (Default value = None [all])"
   print >> log, "# concurrency    :"+ str(concurrency) +"  (Default value = 200)"
   print >> log, "#  URLs  :" +str(total_urls) +"  (Default value = 100)"
   print >> log, "# Use HTML: %s (Default value = False)" % use_html
@@ -813,13 +847,13 @@ def print_ramp(request_index):
   """
   global phase
   if request_index <= int(rampup_rampdown):
-    phase = "RU"
+    phase = phases['RampUp']
     if request_index == 1:
       print ("[%s] Entering Rampup window" % (util.get_current_time()))
     if request_index == int(rampup_rampdown):
       print ("[%s] Exiting Rampup window" % (util.get_current_time()))
   elif (request_index - int(rampup_rampdown)) <= int(request):
-    phase = "MT"
+    phase = phases['SteadyState']
     if (request_index - int(rampup_rampdown)) == 1:
       print ("[%s] Entering Measuring time window" % (util.get_current_time()))
       print "In progress..."
@@ -844,7 +878,7 @@ def print_ramp(request_index):
     if (request_index - int(rampup_rampdown)) == int(request):
       print ("[%s] Exiting Measuring time window" % (util.get_current_time()))
   elif request_index - (int(rampup_rampdown)+int(request)) <= int(rampup_rampdown):
-    phase = "RD"
+    phase = phases['RampDown']
     if request_index - (int(rampup_rampdown)+int(request)) == 1:
       print ("[%s] Entering Rampdown window" % (util.get_current_time()))
     if request_index - (int(rampup_rampdown)+int(request)) == int(rampup_rampdown):
@@ -972,40 +1006,36 @@ def send_request():
   #Print environment
   run_printenv(log)
 
-  if run_mode == 1:
+  if runMode == runModes['Time']:
     print >> log, "File#,MinResp,MeanResp,95percentile,99percentile,MaxResp,Startime,Endtime,#RUReq,#MTReq,#RDReq,TotalReq,Throughput"
   else:
     print >> log, "Mode,Request_num,URL,StartTime,EndTime,Response_time"
 
   log.flush()
-  mem_process = Process(target = collect_meminfo)
-  mem_process.start()
+  #mem_process = Process(target = collect_meminfo)
+  #mem_process.start()
 
   ## Start time based run
-  if run_mode == 1:
+  if runMode == runModes['Time']:
     timebased_run(pool)
   ## Start requests based run
   else:
     requestBasedRun(pool)
 
-  mem_process.join()
+  #mem_process.join()
   if not no_db:
     after_run = check_db()
   print_summary()
   log.close()
   return
 
-def execute_request(pool, queue=None):
+def execute_request(phase, pool, logFile=None):
     """
-    # Desc  : Creates threadpool for concurrency, and sends concurrent requests
-    #         to server for the input #requests or based on time interval.
-    #         Dynamically generates URL with employeeid, zipcode, name for GET
-    #         requests
-    # Input : threadpool with concurrency number of threads
-    # Output: Generates per request details in a templog file
+    # Desc  : Places one request to server in pool.
+    # Input : Current phase, pool to use, logFile
+    # Output: Once completed, the request emits a record to logFile
     """
     global after_run
-    global phase
     global MT_interval
     global rampup_rampdown
     global tot_get
@@ -1041,10 +1071,10 @@ def execute_request(pool, queue=None):
             log_dir,
             phase,
             interval,
-            run_mode,
-            temp_log,
+            runMode,
+            logFile,
             'text/html' if use_html else 'application/json',
-            queue,
+            None,
             http_headers
           ]
 
@@ -1101,11 +1131,11 @@ def timebased_run(pool):
   post_processing.start()
   print ("[%s] Starting time based run." % (util.get_current_time()))
   if ramp:
-    phase = "RU"
+    phase = phases['RampUp']
     start = time.time()
     print("[%s] Entering RampUp time window." % (util.get_current_time()))
   else:
-    phase = "MT"
+    phase = phases['SteadyState']
     start = time.time()
     print("Entering Measuring time window : [%s]" % (util.get_current_time()))
     util.record_start_time()
@@ -1114,7 +1144,7 @@ def timebased_run(pool):
           while(time.time()-start < int(rampup_rampdown)):
               execute_request(pool, queue)
           print ("[%s] Exiting RampUp time window." %(util.get_current_time()))
-          phase = "MT"
+          phase = phases['SteadyState']
           util.record_start_time()
           start=time.time()
           print ("[%s] Entering Measuring time window." %(util.get_current_time()))
@@ -1122,20 +1152,20 @@ def timebased_run(pool):
               execute_request(pool, queue)
           print ("[%s] Exiting Measuring time window." %(util.get_current_time()))
           util.record_end_time()
-          phase = "RD"
+          phase = phases['RampDown']
           util.calculate_throughput(log_dir,concurrency,cpuCount)
           start=time.time()
           print ("[%s] Entering RampDown time window." %(util.get_current_time()))
           while(time.time()-start < int(rampup_rampdown)):
               execute_request(pool, queue)
           print ("[%s] Exiting RampDown time window." %(util.get_current_time()))
-          phase = "SD"
+          phase = phases['ShutDown']
           print ("[%s] Entering ShutDown time window." %(util.get_current_time()))
   else:
           while(time.time()-start < int(MT_interval)):
               execute_request(pool, queue)
           print ("[%s] Exiting Measuring time window." %(util.get_current_time()))
-          phase = "SD"
+          phase = phases['ShutDown']
           print ("[%s] Entering ShutDown time window." %(util.get_current_time()))
   print("[%s] All requests done." % (util.get_current_time()))
   file = open(os.path.join(log_dir,memlogind),"w")
@@ -1145,6 +1175,38 @@ def timebased_run(pool):
   processing_complete = True
   queue.put(('EXIT',))
   post_processing.join()
+
+def mpDriveRequests(args):
+  """
+  Entry point for requests submitted by the multiprocess.Pool
+  - Each worker creates an eventlet GreenPool of size args.concurrency because the work is I/O (network).
+  - Then submits args.nRampUp, args.nSteadyState, and args.nRampDown requests to this pool.
+  - Returns once all requests have completed.
+
+  Output: Summary of each request is in args.logFile
+  """
+
+  print ("Worker: args %s" % (args))
+
+  print ("Creating eventlet pool")
+  # Create a pool with input concurrency
+  pool = eventlet.GreenPool(args['concurrency'])
+
+  # Ramp-up
+  for i in range(0, args['nRampUp']):
+    execute_request(phases['RampUp'], pool, args['logFile'])
+
+  # Steady-state
+  for i in range(0, args['nSteadyState']):
+    execute_request(phases['SteadyState'], pool, args['logFile'])
+
+  # Ramp-down
+  for i in range(0, args['nRampDown']):
+    execute_request(phases['RampDown'], pool, args['logFile'])
+
+  pool.waitall()
+
+  return
 
 def requestBasedRun(pool):
   """
@@ -1164,34 +1226,40 @@ def requestBasedRun(pool):
 
   print ("[%s] Starting request based run." % (util.get_current_time()))
   print ("[%s] Requests:[%d], Concurrency:[%d]" % (util.get_current_time(), int(request), int(concurrency)))
-
   url_index = 0
-  if ramp:
-    loop = int(request)+(2*int(rampup_rampdown))
-  else:
-    loop = int(request)
 
-  for request_index in range(1, (loop+1)):
-      #check for rampup and rampdown requests
-      if ramp:
-         print_ramp(request_index)
-      else:
-        phase = "MT"
-        if request_index == 1:
-          print "Entering Measuring time window"
-        if request_index == int(request):
-          print "Exiting Measuring time window"
-      execute_request(pool)
-  #Wait for request threads to finish
-  file = open(os.path.join(log_dir,memlogind),"w")
-  file.close()
-  pool.waitall()
+  # Create a MP pool
+  print ("Creating MP pool")
+  if nCoresToUse and 0 < nCoresToUse:
+    poolSize = nCoresToUse
+  else:
+    poolSize = multiprocessing.cpu_count()
+  mpPool = multiprocessing.Pool(poolSize)
+
+  # Prep args for each worker
+  workerArgs = []
+  for i in range(0, poolSize):
+    args = {
+      'logFile': "{}-{}".format(temp_log, i),
+      'nRampUp': int(rampup_rampdown / poolSize),
+      'nSteadyState': int(request / poolSize),
+      'nRampDown': int(rampup_rampdown / poolSize),
+      'concurrency': int(concurrency)
+    }
+    workerArgs.append(args)
+
+  # Run the workers
+  print ("Submitting %d jobs to pool" % (len(workerArgs)))
+  mpPool.map(mpDriveRequests, workerArgs, 1)
+  mpPool.close()
+  mpPool.join()
 
   print ("[%s] All requests done." % (util.get_current_time()))
-  post_process_request_based_data(temp_log,output_file)
+  logFiles = map(lambda arg: os.path.join(log_dir, arg['logFile']), workerArgs)
+  post_process_request_based_data(logFiles, rampup_rampdown, request, output_file)
   return
 
-def post_process_request_based_data(temp_log,output_file):
+def post_process_request_based_data(logFiles, nRampUp, nSteadyState, output_file):
   """
   # Desc  : Post processing of log file
   # Input : Input templog and output filename
@@ -1199,42 +1267,62 @@ def post_process_request_based_data(temp_log,output_file):
   #         MIN, MAX, MEAN response time,
   #         throughput, 99 percentile.
   """
-  abs_start = 0;
   col_st = 3; #column number of start time
   col_et = 4
   col_rt = 5; #column number of response time
   col_url = 2; #column number of url
   col_datasize = 6
+  start_time = [] # list with start times of each worker
   read_time = [] #list with elapsed time
   response_array = []
   total_bytes_arr=[]
   url_array = []
   print ("[%s] Post_process phase." % (util.get_current_time()))
-  try:
-    logfile = open(os.path.join(os.path.join(results_dir,directory),temp_log), "r")
-  except IOError as e:
-    print("Error: %s File not found." % temp_log)
-    return None
-  csvReader = csv.reader(logfile)
+
+  # Open the output file
   try:
      processed_filename = os.path.join(os.path.join(results_dir,directory),output_file)
      processed_file = open(processed_filename, 'w')
   except IOError as e:
     print("Error: %s Could not create file." % output_file)
     return None
-  for row in csvReader:
-    if "MT" in row[0]:
-      sortedlist = sorted(csvReader, key=lambda row: int(row[1]))
-      for i in range(len(sortedlist)):
-        read_time.append(float(sortedlist[i][col_et]))
-        url_array.append(sortedlist[i][col_url])
-        response_array.append(float(sortedlist[i][col_rt]))
-        if(abs_start == 0):
-          abs_start = float(sortedlist[0][col_st])
-          continue
-        datasize=sortedlist[i][col_datasize]
-        total_bytes_arr.append(float(datasize))
-  tot_lapsedtime = max(read_time) - abs_start
+
+  for logFileName in logFiles:
+    # Open the input file
+    try:
+      logFile = open(logFileName, "r")
+    except IOError as e:
+      print ("Error: Could not open %s" % (logFileName))
+      continue
+
+    # Munch through the file.
+    csvReader = csv.reader(logFile)
+    nRowsRead = 0
+    nRowsProcessed = 0
+    for row in csvReader:
+      nRowsRead += 1
+      # Discard rows until we've satisfied rampUp.
+      if nRowsRead < nRampUp:
+        continue
+
+      # Wrap up once steadyState is exhausted
+      if nSteadyState < nRowsProcessed:
+        break
+
+      # Capture time of first SteadyState request from each worker
+      if nRowsProcessed == 0:
+        start_time.append(float(row[col_st]))
+
+      # Split row into its constituent metrics.
+      read_time.append(float(row[col_et]))
+      url_array.append(row[col_url])
+      response_array.append(float(row[col_rt]))
+      total_bytes_arr.append(float(row[col_datasize]))
+
+      nRowsProcessed += 1
+    logFile.close()
+
+  tot_lapsedtime = max(read_time) - min(start_time)
   if not tot_lapsedtime:
     throughput = 1
   throughput = float(int(request)/tot_lapsedtime)
@@ -1246,10 +1334,24 @@ def post_process_request_based_data(temp_log,output_file):
   mean = np.mean(respa)
   total_bytes_received = np.sum(total_bytes_arr)
 
+  percent95 = np.percentile(respa, 95)
+  percent99 = np.percentile(respa, 99)
+
   print "\n====Report Summary===="
   print "Primary Metrics:"
   print 'Response time 99 percentile = %.3f sec' % percent
   print 'Throughput = %.2f req/sec' % throughput
+
+  summary = {
+    'reqsPerSec': throughput,
+    'minResponseTime': round(minimum, 3),
+    'maxResponseTime': round(maximum, 3),
+    'meanResponseTime': round(mean, 3),
+    'percent95ResponseTime': round(percent95, 3),
+    'percent99ResponseTime': round(percent99, 3)
+  }
+  print 'JSON-formatted result: <' + json.dumps(summary) + '>'
+
   print "--------------------------------------\n"
   print >> processed_file, "\n====Report Summary===="
   print >> processed_file, "Primary Metrics:"
@@ -1261,7 +1363,6 @@ def post_process_request_based_data(temp_log,output_file):
   print >> processed_file, 'Mean Response time = %.3f sec' % mean
   print >> processed_file, 'Total bytes received = %d bytes' % total_bytes_received
 
-  logfile.close()
   processed_file.flush()
   processed_file.close()
   if not no_graph:
@@ -1423,7 +1524,7 @@ def print_summary():
 
   print >> processed_file, "Requests Validation:"
 
-  if run_mode == 1:
+  if runMode == runModes['Time']:
     print >> processed_file, "Total runtime duration: " +str(int(MT_interval))
   else:
     print >> processed_file, "Total requests processed (MT): "+ str(request)

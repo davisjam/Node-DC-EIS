@@ -4,7 +4,7 @@
     "MT_interval" : "300",
     "request" : "10000",
     "concurrency" : "100",
-    "run_mode" : "1",
+    "run_mode" : "requests",
     "interval" : "10",
     "rampup_rampdown": "25",
     "tempfile":"RTdata",
