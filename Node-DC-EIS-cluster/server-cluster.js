@@ -20,7 +20,12 @@ var appConfig = require('./config/configuration');
 var app_host = appConfig.app_host;
 var port = appConfig.app_port;
 const os = require('os');
+
+// Get cpuCount, override with env var.
 var cpuCount = Number(appConfig.cpu_count);
+if (process.env.CPU_COUNT) {
+	cpuCount = Number(process.env.CPU_COUNT);
+}
 
 function printHostInfo() {
   console.log('********************************');

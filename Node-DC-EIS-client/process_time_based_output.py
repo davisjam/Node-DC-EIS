@@ -246,6 +246,16 @@ def post_process(temp_log,output_file,results_dir,interval,memlogfile,no_graph, 
   print ("[%s] Post processing is done.\n" % (util.get_current_time()))
   processed_file.flush()
 
+  summary = {
+    'reqsPerSec': throughput,
+    'minResponseTime': round(minimum, 3),
+    'maxResponseTime': round(maximum, 3),
+    'meanResponseTime': round(mean, 3),
+    'percent95ResponseTime': round(percent95, 3),
+    'percent99ResponseTime': round(percent99, 3)
+  }
+  print 'JSON-formatted result: <' + json.dumps(summary) + '>'
+
   if not no_graph:
     import matplotlib
     matplotlib.use(matplotlib.get_backend())

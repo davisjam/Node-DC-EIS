@@ -50,6 +50,14 @@ import traceback
 import urllib
 import util
 
+# Seed RNG for consistent runs?
+if os.environ.get('NODE_DC_EIS_RNG_SEED'):
+  rng_seed = int(os.environ.get('NODE_DC_EIS_RNG_SEED'))
+else:
+  rng_seed = None
+print "Using seed {}".format(rng_seed)
+seed(rng_seed)
+
 """
 #  All globals
 """
